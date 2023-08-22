@@ -27,12 +27,12 @@ function registerDevice(element) {
     var availability_topic = 'warema/' + element.snr + '/availability'
 
     var base_payload = {
-        name: element.snr,
         availability: [
             {topic: 'warema/bridge/state'},
             {topic: availability_topic}
         ],
-        unique_id: element.snr
+        unique_id: element.snr,
+        name: null
     }
 
     var base_device = {
@@ -59,6 +59,7 @@ function registerDevice(element) {
                 state_topic: 'warema/' + element.snr + '/illuminance/state',
                 device_class: 'illuminance',
                 unique_id: element.snr + '_illuminance',
+                object_id: element.snr + '_illuminance',
                 unit_of_measurement: 'lx',
             };
             client.publish('homeassistant/sensor/' + element.snr + '/illuminance/config', JSON.stringify(illuminance_payload), {retain: true})
@@ -69,6 +70,7 @@ function registerDevice(element) {
                 state_topic: 'warema/' + element.snr + '/temperature/state',
                 device_class: 'temperature',
                 unique_id: element.snr + '_temperature',
+                object_id: element.snr + '_temperature',
                 unit_of_measurement: '°C',
             }
             client.publish('homeassistant/sensor/' + element.snr + '/temperature/config', JSON.stringify(temperature_payload), {retain: true})
@@ -78,6 +80,7 @@ function registerDevice(element) {
                 state_topic: 'warema/' + element.snr + '/wind/state',
                 device_class: 'wind_speed',
                 unique_id: element.snr + '_wind',
+                object_id: element.snr + '_wind',
                 unit_of_measurement: 'm/s',
             }
             client.publish('homeassistant/sensor/' + element.snr + '/wind/config', JSON.stringify(wind_payload), {retain: true})
@@ -87,7 +90,8 @@ function registerDevice(element) {
                 ...payload,
                 state_topic: 'warema/' + element.snr + '/rain/state',
                 device_class: 'moisture',
-                unique_id: element.snr + '_rain'
+                unique_id: element.snr + '_rain',
+                object_id: element.snr + '_rain',
             }
             client.publish('homeassistant/binary_sensor/' + element.snr + '/rain/config', JSON.stringify(rain_payload), {retain: true})
 
@@ -150,6 +154,16 @@ function registerDevice(element) {
         case 24:
             // TODO: Smart socket
             model = 'Smart socket';
+            payload = {
+                ...base_payload,
+                device: {
+                    ...base_device,
+                    model: model
+                },
+                state_topic: 'warema/' + element.snr + '/state',
+                command_topic: 'warema/' + element.snr + '/set',
+            }
+
             break;
         case 25:
             model = 'Vertical awning';
@@ -316,6 +330,10 @@ client.on('message', function (topic, message) {
     switch (command) {
         case 'set':
             switch (message) {
+                case 'ON':
+                case 'OFF':
+                    //TODO: use stick to turn on/off
+                    break;
                 case 'CLOSE':
                     log.debug('Closing ' + device);
                     stickUsb.vnBlindSetPosition(device, 100)
