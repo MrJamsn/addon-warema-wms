@@ -361,6 +361,9 @@ function callback(err, msg) {
         log.error(err);
     }
     if (msg) {
+        // Debug: Log message structure for MQTT v5 compatibility
+        log.debug('Received message: topic=' + msg.topic + ', payload=' + JSON.stringify(msg.payload));
+        
         switch (msg.topic) {
             case 'wms-vb-init-completion':
                 log.info('Warema init completed')
@@ -409,11 +412,29 @@ function callback(err, msg) {
             case 'wms-vb-blind-position-update':
                 log.debug('Position update: \n' + JSON.stringify(msg.payload, null, 2))
 
+                // Validate message payload
+                if (!msg.payload || !msg.payload.snr) {
+                    log.error('Invalid position update message: missing payload or snr');
+                    return;
+                }
+
+                // Auto-register device if it doesn't exist (this can happen with devices that weren't found during initial scan)
+                if (!devices[msg.payload.snr]) {
+                    log.info('Auto-registering unknown device ' + msg.payload.snr + ' from position update');
+                    registerDevice({snr: msg.payload.snr, type: 25}); // Default to type 25 (Radio motor)
+                }
+
+                // Double-check device exists after registration
+                if (!devices[msg.payload.snr]) {
+                    log.error('Failed to register device ' + msg.payload.snr + ' for position update');
+                    return;
+                }
+
                 // Update device availability when we receive a response
                 updateDeviceAvailability(msg.payload.snr, true);
 
                 if (typeof msg.payload.position !== "undefined") {
-                    const previousPosition = devices[msg.payload.snr].position;
+                    const previousPosition = devices[msg.payload.snr]?.position;
                     devices[msg.payload.snr].position = msg.payload.position;
                     client.publish('warema/' + msg.payload.snr + '/position', '' + msg.payload.position, {retain: true})
 
@@ -563,13 +584,13 @@ client.on('message', function (topic, message) {
             }
             break;
         case 'set_position':
-            log.debug('Setting ' + device + ' to ' + message + '%, angle ' + (devices[device].tilt || 0));
-            const currentAngle = devices[device].tilt || 0;
+            log.debug('Setting ' + device + ' to ' + message + '%, angle ' + (devices[device]?.tilt || 0));
+            const currentAngle = devices[device]?.tilt || 0;
             stickUsb.vnBlindSetPosition(device, parseInt(message), parseInt(currentAngle));
             // Mark device as online when we send a command
             updateDeviceAvailability(device, true);
             // Update state immediately to show movement
-            const currentPosition = devices[device].position || 0;
+            const currentPosition = devices[device]?.position || 0;
             if (parseInt(message) > currentPosition) {
                 client.publish('warema/' + device + '/state', 'closing', {retain: true});
             } else if (parseInt(message) < currentPosition) {
@@ -577,8 +598,8 @@ client.on('message', function (topic, message) {
             }
             break;
         case 'set_tilt':
-            log.debug('Setting ' + device + ' to ' + message + '°, position ' + (devices[device].position || 0));
-            const currentPositionForTilt = devices[device].position || 0;
+            log.debug('Setting ' + device + ' to ' + message + '°, position ' + (devices[device]?.position || 0));
+            const currentPositionForTilt = devices[device]?.position || 0;
             stickUsb.vnBlindSetPosition(device, parseInt(currentPositionForTilt), parseInt(message));
             // Mark device as online when we send a command
             updateDeviceAvailability(device, true);
