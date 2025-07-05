@@ -3,6 +3,16 @@ const log = require('./logger');
 const mqtt = require('mqtt');
 
 process.on('SIGINT', function () {
+    // Clean up intervals
+    if (availabilityCheckInterval) {
+        clearInterval(availabilityCheckInterval);
+    }
+    if (wakeUpIntervalTimer) {
+        clearInterval(wakeUpIntervalTimer);
+    }
+    if (rescanIntervalTimer) {
+        clearInterval(rescanIntervalTimer);
+    }
     process.exit(0);
 });
 
@@ -11,6 +21,9 @@ const ignoredDevices = process.env.IGNORED_DEVICES ? process.env.IGNORED_DEVICES
 const forceDevices = process.env.FORCE_DEVICES ? process.env.FORCE_DEVICES.split(',') : [];
 const pollingInterval = process.env.POLLING_INTERVAL || 30000;
 const movingInterval = process.env.MOVING_INTERVAL || 1000;
+const availabilityTimeout = process.env.AVAILABILITY_TIMEOUT || 300000; // 5 minutes default
+const wakeUpInterval = process.env.WAKE_UP_INTERVAL || 60000; // 1 minute default
+const rescanInterval = process.env.RESCAN_INTERVAL || 3600000; // 1 hour default - periodic re-scanning
 
 const settingsPar = {
     wmsChannel: process.env.WMS_CHANNEL || 17,
@@ -20,6 +33,128 @@ const settingsPar = {
 };
 
 const devices = [];
+const deviceAvailability = {}; // Track device availability status
+const deviceLastSeen = {}; // Track when devices were last seen
+
+// Function to update device availability
+function updateDeviceAvailability(snr, isOnline) {
+    const availability_topic = 'warema/' + snr + '/availability';
+    const wasOnline = deviceAvailability[snr];
+    
+    if (isOnline !== wasOnline) {
+        deviceAvailability[snr] = isOnline;
+        if (isOnline) {
+            deviceLastSeen[snr] = Date.now();
+            log.info('Device ' + snr + ' is now online');
+        } else {
+            log.warn('Device ' + snr + ' is now offline');
+        }
+        client.publish(availability_topic, isOnline ? 'online' : 'offline', {retain: true});
+    } else if (isOnline) {
+        deviceLastSeen[snr] = Date.now();
+    }
+}
+
+// Function to check device availability based on last seen time
+function checkDeviceAvailability() {
+    const now = Date.now();
+    let hasLongOfflineDevices = false;
+    
+    for (const snr in deviceLastSeen) {
+        const timeSinceLastSeen = now - deviceLastSeen[snr];
+        if (timeSinceLastSeen > availabilityTimeout) {
+            updateDeviceAvailability(snr, false);
+            // Check if device has been offline for more than 2x the availability timeout
+            if (timeSinceLastSeen > availabilityTimeout * 2) {
+                hasLongOfflineDevices = true;
+            }
+        }
+    }
+    
+    // Force re-scan if devices have been offline for too long
+    if (hasLongOfflineDevices) {
+        log.warn('Some devices have been offline for extended period, forcing re-scan...');
+        performPeriodicRescan();
+    }
+}
+
+// Function to wake up sleeping devices
+function wakeUpDevices() {
+    let offlineCount = 0;
+    
+    for (const snr in devices) {
+        if (deviceAvailability[snr] === false) {
+            offlineCount++;
+            log.debug('Attempting to wake up device ' + snr);
+            
+            // Try multiple wake-up approaches
+            try {
+                // 1. Send a wave request to wake up the device
+                stickUsb.vnBlindWaveRequest(snr);
+                
+                // 2. Try to get position (this can also wake up devices)
+                setTimeout(() => {
+                    if (deviceAvailability[snr] === false) {
+                        log.debug('Trying position request for device ' + snr);
+                        stickUsb.vnBlindGetPosition(snr, {
+                            cmdConfirmation: false,
+                            callbackOnUnchangedPos: false
+                        });
+                    }
+                }, 1000);
+                
+            } catch (error) {
+                log.error('Error waking up device ' + snr + ': ' + error.message);
+            }
+        }
+    }
+    
+    // If too many devices are offline, consider a re-scan
+    if (offlineCount > 0 && offlineCount >= Object.keys(devices).length / 2) {
+        log.warn('More than half of devices are offline, considering re-scan...');
+        // This will trigger a re-scan on the next availability check
+    }
+}
+
+// Function to perform periodic re-scanning
+function performPeriodicRescan() {
+    log.info('Performing periodic device re-scan...');
+    
+    // Check if any devices are offline
+    const offlineDevices = Object.keys(deviceAvailability).filter(snr => deviceAvailability[snr] === false);
+    
+    if (offlineDevices.length > 0) {
+        log.info('Found ' + offlineDevices.length + ' offline devices, performing re-scan...');
+        
+        // Clear current device registrations
+        const currentDevices = Object.keys(devices);
+        currentDevices.forEach(snr => {
+            log.debug('Clearing registration for device ' + snr);
+            stickUsb.vnBlindRemove(snr);
+        });
+        
+        // Clear availability tracking
+        Object.keys(deviceAvailability).forEach(snr => {
+            delete deviceAvailability[snr];
+            delete deviceLastSeen[snr];
+        });
+        
+        // Clear devices array
+        Object.keys(devices).forEach(snr => {
+            delete devices[snr];
+        });
+        
+        // Perform new scan
+        stickUsb.scanDevices({autoAssignBlinds: false});
+    } else {
+        log.debug('All devices are online, skipping re-scan');
+    }
+}
+
+// Set up availability checking intervals
+let availabilityCheckInterval;
+let wakeUpIntervalTimer;
+let rescanIntervalTimer;
 
 function registerDevice(element) {
     log.info('Registering ' + element.snr)
@@ -97,8 +232,14 @@ function registerDevice(element) {
 
             client.publish(availability_topic, 'online', {retain: true})
 
-            devices[element.snr] = {};
-            // No need to add to stick, updates are broadcasted
+            devices[element.snr] = {
+                position: undefined,
+                tilt: undefined
+            };
+
+            // Initialize availability tracking
+            deviceAvailability[element.snr] = true;
+            deviceLastSeen[element.snr] = Date.now();
 
             return;
         case 7:
@@ -123,10 +264,10 @@ function registerDevice(element) {
                 tilt_status_topic: 'warema/' + element.snr + '/tilt',
                 set_position_topic: 'warema/' + element.snr + '/set_position',
                 tilt_command_topic: 'warema/' + element.snr + '/set_tilt',
-                tilt_closed_value: -100,
-                tilt_opened_value: 100,
-                tilt_min: -100,
-                tilt_max: 100,
+                tilt_closed_value: -75,
+                tilt_opened_value: 75,
+                tilt_min: -75,
+                tilt_max: 75,
             }
             break;
         case 21:
@@ -144,10 +285,10 @@ function registerDevice(element) {
                 tilt_status_topic: 'warema/' + element.snr + '/tilt',
                 set_position_topic: 'warema/' + element.snr + '/set_position',
                 tilt_command_topic: 'warema/' + element.snr + '/set_tilt',
-                tilt_closed_value: -100,
-                tilt_opened_value: 100,
-                tilt_min: -100,
-                tilt_max: 100,
+                tilt_closed_value: -75,
+                tilt_opened_value: 75,
+                tilt_min: -75,
+                tilt_max: 75,
             }
 
             break;
@@ -166,7 +307,7 @@ function registerDevice(element) {
 
             break;
         case 25:
-            model = 'Vertical awning';
+            model = 'Radio motor';
             payload = {
                 ...base_payload,
                 device: {
@@ -178,7 +319,13 @@ function registerDevice(element) {
                 state_topic: 'warema/' + element.snr + '/state',
                 command_topic: 'warema/' + element.snr + '/set',
                 position_topic: 'warema/' + element.snr + '/position',
+                tilt_status_topic: 'warema/' + element.snr + '/tilt',
                 set_position_topic: 'warema/' + element.snr + '/set_position',
+                tilt_command_topic: 'warema/' + element.snr + '/set_tilt',
+                tilt_closed_value: -75,
+                tilt_opened_value: 75,
+                tilt_min: -75,
+                tilt_max: 75,
             }
 
             break;
@@ -195,7 +342,14 @@ function registerDevice(element) {
 
         stickUsb.vnBlindAdd(parseInt(element.snr), element.snr.toString());
 
-        devices[element.snr] = {};
+        devices[element.snr] = {
+            position: undefined,
+            tilt: undefined
+        };
+
+        // Initialize availability tracking
+        deviceAvailability[element.snr] = true;
+        deviceLastSeen[element.snr] = Date.now();
 
         client.publish(availability_topic, 'online', {retain: true})
         client.publish(topic, JSON.stringify(payload), {retain: true})
@@ -213,6 +367,14 @@ function callback(err, msg) {
 
                 stickUsb.setPosUpdInterval(pollingInterval);
                 stickUsb.setWatchMovingBlindsInterval(movingInterval);
+
+                // Enable command confirmation notifications for availability tracking
+                stickUsb.setCmdConfirmationNotificationEnabled(true);
+
+                // Set up availability checking intervals
+                availabilityCheckInterval = setInterval(checkDeviceAvailability, availabilityTimeout / 2);
+                wakeUpIntervalTimer = setInterval(wakeUpDevices, wakeUpInterval);
+                rescanIntervalTimer = setInterval(performPeriodicRescan, rescanInterval);
 
                 log.info('Scanning...')
 
@@ -247,11 +409,42 @@ function callback(err, msg) {
             case 'wms-vb-blind-position-update':
                 log.debug('Position update: \n' + JSON.stringify(msg.payload, null, 2))
 
+                // Update device availability when we receive a response
+                updateDeviceAvailability(msg.payload.snr, true);
+
                 if (typeof msg.payload.position !== "undefined") {
+                    const previousPosition = devices[msg.payload.snr].position;
                     devices[msg.payload.snr].position = msg.payload.position;
                     client.publish('warema/' + msg.payload.snr + '/position', '' + msg.payload.position, {retain: true})
 
-                    if (msg.payload.moving === false) {
+                    // Update state based on position and moving status
+                    if (msg.payload.moving === true) {
+                        // Device is currently moving - determine direction
+                        if (typeof previousPosition !== "undefined") {
+                            if (msg.payload.position > previousPosition) {
+                                client.publish('warema/' + msg.payload.snr + '/state', 'closing', {retain: true});
+                            } else if (msg.payload.position < previousPosition) {
+                                client.publish('warema/' + msg.payload.snr + '/state', 'opening', {retain: true});
+                            } else {
+                                // Position unchanged but still moving - use position-based logic
+                                if (msg.payload.position === 0)
+                                    client.publish('warema/' + msg.payload.snr + '/state', 'opening', {retain: true});
+                                else if (msg.payload.position === 100)
+                                    client.publish('warema/' + msg.payload.snr + '/state', 'closing', {retain: true});
+                                else
+                                    client.publish('warema/' + msg.payload.snr + '/state', 'closing', {retain: true}); // Default to closing for intermediate positions
+                            }
+                        } else {
+                            // No previous position available - use position-based logic
+                            if (msg.payload.position === 0)
+                                client.publish('warema/' + msg.payload.snr + '/state', 'opening', {retain: true});
+                            else if (msg.payload.position === 100)
+                                client.publish('warema/' + msg.payload.snr + '/state', 'closing', {retain: true});
+                            else
+                                client.publish('warema/' + msg.payload.snr + '/state', 'closing', {retain: true}); // Default to closing for intermediate positions
+                        }
+                    } else {
+                        // Device has stopped moving
                         if (msg.payload.position === 0)
                             client.publish('warema/' + msg.payload.snr + '/state', 'open', {retain: true});
                         else if (msg.payload.position === 100)
@@ -260,9 +453,22 @@ function callback(err, msg) {
                             client.publish('warema/' + msg.payload.snr + '/state', 'stopped', {retain: true});
                     }
                 }
-                if (typeof msg.payload.tilt !== "undefined") {
-                    devices[msg.payload.snr].tilt = msg.payload.tilt;
+                if (typeof msg.payload.angle !== "undefined") {
+                    devices[msg.payload.snr].tilt = msg.payload.angle;
                     client.publish('warema/' + msg.payload.snr + '/tilt', '' + msg.payload.angle, {retain: true})
+                }
+                break;
+            case 'wms-vb-cmd-result-set-position':
+            case 'wms-vb-cmd-result-get-position':
+            case 'wms-vb-cmd-result-stop':
+                // Handle command results to track device availability
+                if (msg.payload.error) {
+                    log.warn('Command failed for device ' + msg.payload.snr + ': ' + msg.payload.error);
+                    // Mark device as offline if command failed
+                    updateDeviceAvailability(msg.payload.snr, false);
+                } else {
+                    // Command succeeded, device is responsive
+                    updateDeviceAvailability(msg.payload.snr, true);
                 }
                 break;
             default:
@@ -338,25 +544,44 @@ client.on('message', function (topic, message) {
                     log.debug('Closing ' + device);
                     stickUsb.vnBlindSetPosition(device, 100)
                     client.publish('warema/' + device + '/state', 'closing');
+                    // Mark device as online when we send a command
+                    updateDeviceAvailability(device, true);
                     break;
                 case 'OPEN':
                     log.debug('Opening ' + device);
                     stickUsb.vnBlindSetPosition(device, 0);
                     client.publish('warema/' + device + '/state', 'opening');
+                    // Mark device as online when we send a command
+                    updateDeviceAvailability(device, true);
                     break;
                 case 'STOP':
                     log.debug('Stopping ' + device);
                     stickUsb.vnBlindStop(device);
+                    // Mark device as online when we send a command
+                    updateDeviceAvailability(device, true);
                     break;
             }
             break;
         case 'set_position':
-            log.debug('Setting ' + device + ' to ' + message + '%, angle ' + devices[device].angle);
-            stickUsb.vnBlindSetPosition(device, parseInt(message), parseInt(devices[device]['angle']))
+            log.debug('Setting ' + device + ' to ' + message + '%, angle ' + (devices[device].tilt || 0));
+            const currentAngle = devices[device].tilt || 0;
+            stickUsb.vnBlindSetPosition(device, parseInt(message), parseInt(currentAngle));
+            // Mark device as online when we send a command
+            updateDeviceAvailability(device, true);
+            // Update state immediately to show movement
+            const currentPosition = devices[device].position || 0;
+            if (parseInt(message) > currentPosition) {
+                client.publish('warema/' + device + '/state', 'closing', {retain: true});
+            } else if (parseInt(message) < currentPosition) {
+                client.publish('warema/' + device + '/state', 'opening', {retain: true});
+            }
             break;
         case 'set_tilt':
-            log.debug('Setting ' + device + ' to ' + message + '°, position ' + devices[device].position);
-            stickUsb.vnBlindSetPosition(device, parseInt(devices[device]['position']), parseInt(message))
+            log.debug('Setting ' + device + ' to ' + message + '°, position ' + (devices[device].position || 0));
+            const currentPositionForTilt = devices[device].position || 0;
+            stickUsb.vnBlindSetPosition(device, parseInt(currentPositionForTilt), parseInt(message));
+            // Mark device as online when we send a command
+            updateDeviceAvailability(device, true);
             break;
         default:
             log.info('Unrecognised command from HA')

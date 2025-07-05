@@ -30,6 +30,9 @@ MOVING_INTERVAL
 : Default value: 1000. Minimum value: 100, Time interval between each request to a moving device to report position and state.
 This applies only to covers being opened or closed, for the duration of the operation or until stopped. Set to 0 to disable.
 
+RESCAN_INTERVAL
+: Default value: 3600000 (1 hour). Time interval in ms between periodic device re-scans. If any devices are offline, a re-scan will be triggered at this interval to refresh the device list and recover from missed or stale registrations.
+
 WMS_CHANNEL, WMS_KEY, WMS_PAN_ID
 : Use these parameters to configure the WMS network your devices are connected to. In order to discover the parameters, start the addon with a `PAN_ID` equal to
 `FFFFF`, and follow the instructions described at the WMS network parameter discovery section ([here](#wms-discovery)).
